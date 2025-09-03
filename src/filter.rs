@@ -292,6 +292,89 @@ mod simd {
             c_bpp = b_bpp.try_into().unwrap();
         }
     }
+
+    // Predictor for AVG filter: floor((left + above) / 2)
+    #[inline(always)]
+    fn avg_predictor_simd<const BPP: usize>(
+        left: Simd<u8, BPP>,
+        above: Simd<u8, BPP>,
+    ) -> Simd<u8, BPP>
+    where
+        LaneCount<BPP>: SupportedLaneCount,
+    {
+        ((left.cast::<u16>() + above.cast::<u16>()) >> Simd::splat(1)).cast::<u8>()
+    }
+
+    // Processes a chunk of 8 pixels (24 bytes) for bpp3 using AVG filter
+    #[inline(always)]
+    fn process_avg_chunk_bpp3_s24(
+        mut current_a: Simd<u8, 3>, // Unfiltered left pixel from previous iteration/chunk
+        b_vec: &Simd<u8, 24>,       // Unfiltered above row chunk
+        x_out: &mut Simd<u8, 24>,   // Current row chunk (filtered -> unfiltered)
+    ) -> Simd<u8, 3> {
+        let x_in = *x_out;
+        let mut preds = [0u8; 24];
+
+        macro_rules! process_pixel {
+            ($shift:expr) => {
+                let pred = avg_predictor_simd(current_a, b_vec.extract::<$shift, 3>());
+                current_a = x_in.extract::<$shift, 3>() + pred;
+                preds[$shift..$shift + 3].copy_from_slice(pred.as_array());
+            };
+        }
+
+        process_pixel!(0);
+        process_pixel!(3);
+        process_pixel!(6);
+        process_pixel!(9);
+        process_pixel!(12);
+        process_pixel!(15);
+        process_pixel!(18);
+        process_pixel!(21);
+
+        *x_out += Simd::from_array(preds);
+        current_a
+    }
+
+    pub fn avg_unfilter_bpp3(current: &mut [u8], previous: &[u8]) {
+        const BPP: usize = 3;
+        const STRIDE_BYTES: usize = 24; // 8 pixels * 3 bytes/pixel
+
+        let mut vlast_simd: Simd<u8, BPP> = Default::default(); // Left pixel (unfiltered)
+
+        let chunks = current.len() / STRIDE_BYTES;
+
+        let (simd_current, remainder_current) = current.split_at_mut(chunks * STRIDE_BYTES);
+        let (simd_previous, remainder_prev_row) = previous.split_at(chunks * STRIDE_BYTES);
+
+        let current_iter = simd_current.chunks_exact_mut(STRIDE_BYTES);
+        let previous_iter = simd_previous.chunks_exact(STRIDE_BYTES);
+        let combined_iter = current_iter.zip(previous_iter);
+
+        for (current_chunk, previous_chunk) in combined_iter {
+            let mut x: Simd<u8, STRIDE_BYTES> = Simd::<u8, STRIDE_BYTES>::from_slice(current_chunk);
+            let b: Simd<u8, STRIDE_BYTES> = Simd::<u8, STRIDE_BYTES>::from_slice(previous_chunk);
+
+            vlast_simd = process_avg_chunk_bpp3_s24(vlast_simd, &b, &mut x);
+
+            x.copy_to_slice(current_chunk);
+        }
+
+        // Scalar remainder
+        let mut vlast_scalar = vlast_simd.to_array();
+        for (chunk, above) in remainder_current
+            .chunks_exact_mut(BPP)
+            .zip(remainder_prev_row.chunks_exact(BPP))
+        {
+            let new_chunk = [
+                chunk[0].wrapping_add(((above[0] as u16 + vlast_scalar[0] as u16) / 2) as u8),
+                chunk[1].wrapping_add(((above[1] as u16 + vlast_scalar[1] as u16) / 2) as u8),
+                chunk[2].wrapping_add(((above[2] as u16 + vlast_scalar[2] as u16) / 2) as u8),
+            ];
+            *TryInto::<&mut [u8; BPP]>::try_into(chunk).unwrap() = new_chunk;
+            vlast_scalar = new_chunk;
+        }
+    }
 }
 
 // This code path is used on non-x86_64 architectures but we allow dead code
@@ -599,7 +682,13 @@ pub(crate) fn unfilter(
                     prev = new_chunk;
                 }
             }
-            BytesPerPixel::Three => {
+            BytesPerPixel::Three =>
+            {
+                #[cfg(feature = "unstable")]
+                {
+                    simd::avg_unfilter_bpp3(current, previous);
+                    return;
+                }
                 let mut prev = [0; 3];
                 for chunk in current.chunks_exact_mut(3) {
                     let new_chunk = [
